@@ -1,0 +1,7 @@
+test_neighbors.csv
+submission.csv
+val_neighbors.csv
+__pycache__/
+myvenv/
+output/
+wandb/
