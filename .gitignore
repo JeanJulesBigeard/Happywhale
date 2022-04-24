@@ -5,3 +5,4 @@ __pycache__/
 myvenv/
 output/
 wandb/
+.ipynb_checkpoints/
