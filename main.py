@@ -1,12 +1,8 @@
 # General imports
-import imp
 import os
 import gc
-import cv2
-import math
 import copy
 import time
-import random
 import wandb
 
 # For data manipulation
@@ -15,27 +11,20 @@ import pandas as pd
 
 # Pytorch Imports
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.optim import lr_scheduler
-from torch.utils.data import Dataset, DataLoader
-from torch.cuda import amp
+from torch.utils.data import DataLoader
 
 # Utils
-import joblib
 from tqdm import tqdm
 from collections import defaultdict
 
 # Import the model
-from model import HappyWhaleModel
+from models import HappyWhaleNet, ArcFaceLossAdaptiveMargin
 
 # Sklearn Imports
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import StratifiedKFold
-
-# For Image Models
-import timm
 
 # Albumentations for augmentations
 import albumentations as A
@@ -52,7 +41,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Utils
-from utils import set_seed
+from utils import set_seed, GradualWarmupSchedulerV2
 
 # Dataset
 from dataset import HappyWhaleDataset
@@ -83,10 +72,9 @@ CONFIG = {
     "n_accumulate": 1,
     "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
     # ArcFace Hyperparameters
-    "s": 30.0,
-    "m": 0.50,
-    "ls_eps": 0.0,
-    "easy_margin": False,
+    "s": 80,
+    "m": 0.45,
+    "b": 0.05,
     "data_transforms": {
         "train": A.Compose(
             [
@@ -162,16 +150,18 @@ for fold, (_, val_) in enumerate(skf.split(X=df, y=df.individual_id)):
 data_transforms = CONFIG["data_transforms"]
 
 # Create the model
-model = HappyWhaleModel(CONFIG["model_name"], CONFIG["embedding_size"], CONFIG)
+model = HappyWhaleNet(CONFIG["model_name"], out_dim=CONFIG["num_classes"])
 model.to(CONFIG["device"])
 
-# Define the loss function
-def criterion(outputs, labels):
-    return nn.CrossEntropyLoss()(outputs, labels)
+
+def criterion(logits_m, target, margins):
+    arc = ArcFaceLossAdaptiveMargin(margins=margins, s=CONFIG["s"])
+    loss_m = arc(logits_m, target, out_dim=CONFIG["num_classes"])
+    return loss_m
 
 
 # Traning function
-def train_one_epoch(model, optimizer, scheduler, dataloader, device, epoch):
+def train_one_epoch(model, optimizer, scheduler, dataloader, device, epoch, margins):
     model.train()
 
     dataset_size = 0
@@ -184,8 +174,8 @@ def train_one_epoch(model, optimizer, scheduler, dataloader, device, epoch):
 
         batch_size = images.size(0)
 
-        outputs = model(images, labels)
-        loss = criterion(outputs, labels)
+        outputs = model(images)
+        loss = criterion(outputs, labels, margins)
         loss = loss / CONFIG["n_accumulate"]
 
         loss.backward()
@@ -213,7 +203,7 @@ def train_one_epoch(model, optimizer, scheduler, dataloader, device, epoch):
 
 
 @torch.inference_mode()
-def valid_one_epoch(model, dataloader, device, epoch, optimizer):
+def valid_one_epoch(model, dataloader, device, epoch, optimizer, margins):
     model.eval()
 
     dataset_size = 0
@@ -226,8 +216,8 @@ def valid_one_epoch(model, dataloader, device, epoch, optimizer):
 
         batch_size = images.size(0)
 
-        outputs = model(images, labels)
-        loss = criterion(outputs, labels)
+        outputs = model(images)
+        loss = criterion(outputs, labels, margins)
 
         running_loss += loss.item() * batch_size
         dataset_size += batch_size
@@ -255,6 +245,10 @@ def run_training(model, optimizer, scheduler, device, num_epochs):
     best_epoch_loss = np.inf
     history = defaultdict(list)
 
+    # get adaptive margin
+    tmp = np.sqrt(1 / np.sqrt(df["individual_id"].value_counts().sort_index().values))
+    margins = (tmp - tmp.min()) / (tmp.max() - tmp.min()) * CONFIG["m"] + CONFIG["b"]
+
     for epoch in range(1, num_epochs + 1):
         gc.collect()
         train_epoch_loss = train_one_epoch(
@@ -264,6 +258,7 @@ def run_training(model, optimizer, scheduler, device, num_epochs):
             dataloader=train_loader,
             device=CONFIG["device"],
             epoch=epoch,
+            margins=margins,
         )
 
         val_epoch_loss = valid_one_epoch(
@@ -272,6 +267,7 @@ def run_training(model, optimizer, scheduler, device, num_epochs):
             device=CONFIG["device"],
             epoch=epoch,
             optimizer=optimizer,
+            margins=margins,
         )
 
         history["Train Loss"].append(train_epoch_loss)
@@ -295,8 +291,6 @@ def run_training(model, optimizer, scheduler, device, num_epochs):
             torch.save(model.state_dict(), PATH)
             # Save a model file from the current directory
             print(f"Model Saved{sr_}")
-
-        print()
 
     end = time.time()
     time_elapsed = end - start
@@ -364,7 +358,9 @@ optimizer = optim.Adam(
     model.parameters(), lr=CONFIG["learning_rate"], weight_decay=CONFIG["weight_decay"]
 )
 scheduler = fetch_scheduler(optimizer)
-
+scheduler = GradualWarmupSchedulerV2(
+    optimizer, multiplier=10, total_epoch=1, after_scheduler=scheduler
+)
 
 model, history = run_training(
     model, optimizer, scheduler, device=CONFIG["device"], num_epochs=CONFIG["epochs"]
