@@ -7,3 +7,9 @@ Whale / Dolphin identification using Dynamic Margin ArcFace with EfficientNet ba
 
 
 ![alt text](https://storage.googleapis.com/kaggle-media/competitions/Happywhale/AU%20Kaggle%20Competition%20Description%20Image-03.jpg)
+
+TO DO:
+
+- Add [GeM pooling](https://amaarora.github.io/2020/08/30/gempool.html)
+- Add classifation head
+- Add batchnorm in neck
